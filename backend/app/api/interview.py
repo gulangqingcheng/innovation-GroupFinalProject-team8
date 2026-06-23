@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 import re
 from datetime import datetime
 from io import BytesIO
@@ -15,11 +16,13 @@ from fastapi.responses import StreamingResponse
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
+from app.agents.interview_agent import InterviewAgent
 from app.api.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models.conversation import Conversation
 from app.models.interview import InterviewSession, InterviewTurn
+from app.models.recording import InterviewRecording
 from app.models.user import User
 from app.schemas.common import APIResponse, PaginatedResponse
 from app.schemas.interview import (
@@ -31,6 +34,7 @@ from app.schemas.interview import (
 )
 
 router = APIRouter(prefix="/api/v1/interview", tags=["AI面试"])
+logger = logging.getLogger(__name__)
 
 DIMENSIONS = {
     "岗位相关性": 18,
@@ -699,14 +703,40 @@ async def answer_session(
     if not turn:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前没有待回答的问题")
 
-    result = _score_answer(session, turn, request)
+    # 如果 answer_text 为空但提供了 recording_id，从数据库取转写文本
+    if not (request.answer_text and request.answer_text.strip()) and request.recording_id:
+        recording = (
+            db.query(InterviewRecording)
+            .filter(
+                InterviewRecording.id == request.recording_id,
+                InterviewRecording.user_id == current_user.id,
+            )
+            .first()
+        )
+        if recording and recording.transcript:
+            request.answer_text = recording.transcript
+
+    # 使用 AI 生成反馈（如果可用），降级到现有评分逻辑
+    try:
+        agent = InterviewAgent()
+        ai_result = await agent.generate_feedback(turn.question, request.answer_text or "")
+        score = ai_result["score"]
+        feedback = ai_result["feedback"]
+        suggestion = ai_result["suggestion"]
+    except Exception as e:
+        logger.warning("AI 反馈生成失败，降级到规则评分: %s", e)
+        result = _score_answer(session, turn, request)
+        score = result["score"]
+        feedback = result["feedback"]
+        suggestion = result["suggestion"]
+
     turn.answer_text = request.answer_text.strip() if request.answer_text else None
     turn.answer_audio_url = request.answer_audio_url
     turn.answer_duration_seconds = request.answer_duration_seconds
     turn.answered_at = datetime.now()
-    turn.score = result["score"]
-    turn.feedback = result["feedback"]
-    turn.suggestion = result["suggestion"]
+    turn.score = score
+    turn.feedback = feedback
+    turn.suggestion = suggestion
 
     if turn.question_index < session.question_count:
         _create_turn(db, session, turn.question_index + 1)

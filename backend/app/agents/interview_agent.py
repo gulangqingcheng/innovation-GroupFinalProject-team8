@@ -1,304 +1,161 @@
 """
-AI 面试官模块
-
-负责生成面试问题、进行追问判断，支持根据用户前置条件生成问题。
+面试反馈 Agent
+使用 Qwen 模型生成个性化的面试回答反馈
 """
 
 import json
-from typing import Any, Optional
+import logging
+import re
+
+from openai import AsyncOpenAI
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# 面试反馈系统提示词
+INTERVIEW_FEEDBACK_SYSTEM_PROMPT = """你是一位资深的技术面试官，请对候选人的回答进行专业评估。
+
+请根据以下维度评估回答：
+1. 内容相关性（是否回答了问题）
+2. 结构清晰度（是否有条理、有逻辑）
+3. 深度和细节（是否有具体例子、数据支撑）
+4. 语言表达（是否流畅、专业）
+
+请直接输出 JSON 格式，不要输出其他内容。JSON 格式如下：
+{
+    "score": <0-100 的数值>,
+    "feedback": "<100-200字的具体反馈，指出优点和不足>",
+    "suggestion": "<50-100字的改进建议>"
+}
+
+注意：
+- score 要根据回答质量客观给出，不要总是给高分
+- feedback 要具体，指出回答中的具体优点和不足
+- suggestion 要可操作，给出具体的改进方向
+- 如果回答很短（少于20字），score 不要超过60
+- 如果回答离题或不相关，score 不要超过50
+"""
 
 
 class InterviewAgent:
     """
-    AI 面试官代理
+    面试反馈 Agent
     
-    根据目标岗位、面试类型和难度生成问题，并支持追问。
+    使用阿里云 Qwen 模型生成个性化的面试回答反馈
     """
 
-    DIMENSIONS = {
-        "岗位相关性": 18,
-        "技术深度": 24,
-        "逻辑结构": 18,
-        "案例与结果": 18,
-        "表达沟通": 12,
-        "时间控制": 10,
-    }
-
-    QUESTION_TEMPLATES = {
-        "technical": [
-            {
-                "template": "请介绍你在{position}方向最有代表性的项目，以及你承担的核心职责。",
-                "question_type": "project",
-                "expected_points": ["项目背景", "技术选型", "个人贡献", "结果复盘"],
-            },
-            {
-                "template": "在{position}工作中遇到复杂问题时，你通常如何定位原因并验证解决方案？",
-                "question_type": "problem_solving",
-                "expected_points": ["问题定位", "分析思路", "验证方法", "复盘总结"],
-            },
-            {
-                "template": "请结合实例说明你如何保证交付质量，并处理性能、稳定性或可维护性问题。",
-                "question_type": "quality_assurance",
-                "expected_points": ["质量保障", "性能优化", "稳定性", "可维护性"],
-            },
-            {
-                "template": "如果需要你从零设计一个与{position}相关的功能，你会如何拆解需求和制定方案？",
-                "question_type": "system_design",
-                "expected_points": ["需求分析", "方案设计", "技术选型", "实施计划"],
-            },
-            {
-                "template": "请谈谈你近期学习的一项与{position}相关的新技术，以及它适合解决什么问题。",
-                "question_type": "learning",
-                "expected_points": ["技术理解", "适用场景", "实践经验", "价值评估"],
-            },
-        ],
-        "behavioral": [
-            {
-                "template": "请介绍一次你主动推动团队目标达成的经历。",
-                "question_type": "initiative",
-                "expected_points": ["目标设定", "行动过程", "团队协作", "成果达成"],
-            },
-            {
-                "template": "请描述一次你与团队成员意见不一致的情况，以及你如何处理。",
-                "question_type": "conflict_resolution",
-                "expected_points": ["冲突分析", "沟通方式", "解决方案", "结果反思"],
-            },
-            {
-                "template": "请分享一次你面对紧迫期限时安排优先级的经历。",
-                "question_type": "prioritization",
-                "expected_points": ["优先级判断", "计划安排", "执行过程", "结果评估"],
-            },
-            {
-                "template": "请说明一次失败或失误给你带来的经验。",
-                "question_type": "failure_learning",
-                "expected_points": ["问题分析", "原因反思", "改进措施", "经验总结"],
-            },
-            {
-                "template": "你为什么希望从事{position}相关工作，未来的成长目标是什么？",
-                "question_type": "career_goals",
-                "expected_points": ["动机分析", "岗位匹配", "目标设定", "计划路径"],
-            },
-        ],
-        "comprehensive": [
-            {
-                "template": "请做一个简短的自我介绍，并说明你与{position}岗位的匹配点。",
-                "question_type": "self_introduction",
-                "expected_points": ["背景介绍", "核心优势", "岗位匹配", "个人特质"],
-            },
-            {
-                "template": "请介绍一个最能体现你解决问题能力的项目经历。",
-                "question_type": "problem_solving",
-                "expected_points": ["问题描述", "分析过程", "解决方案", "成果展示"],
-            },
-            {
-                "template": "面对不熟悉的任务时，你会如何快速学习并交付结果？",
-                "question_type": "learning_ability",
-                "expected_points": ["学习方法", "资源利用", "实践过程", "成果产出"],
-            },
-            {
-                "template": "请描述你如何与团队协作并保证信息同步。",
-                "question_type": "team_collaboration",
-                "expected_points": ["沟通机制", "协作方式", "信息同步", "冲突处理"],
-            },
-            {
-                "template": "你对{position}岗位的核心能力有哪些理解？",
-                "question_type": "position_understanding",
-                "expected_points": ["能力认知", "技术要求", "软技能", "发展方向"],
-            },
-        ],
-    }
-
-    DIFFICULTY_LABELS = {
-        "easy": "基础",
-        "medium": "进阶",
-        "hard": "深入",
-    }
-
     def __init__(self):
-        self.client = None
+        if not settings.DASHSCOPE_API_KEY:
+            raise RuntimeError("DashScope API Key 未配置")
+        
+        self.client = AsyncOpenAI(
+            api_key=settings.DASHSCOPE_API_KEY,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        self.model = "qwen-turbo"  # 使用快速模型
 
-    def _llm_enabled(self) -> bool:
-        """检查是否配置了 LLM API Key"""
-        api_key = (settings.LLM_API_KEY or "").strip()
-        return bool(api_key and api_key != "your-api-key-here")
-
-    def _call_llm_json(self, system_prompt: str, user_prompt: str, max_tokens: int = 1600) -> Optional[dict[str, Any]]:
-        """调用大模型获取 JSON 响应"""
-        if not self._llm_enabled():
-            return None
-
-        try:
-            from openai import OpenAI
-
-            client = OpenAI(
-                api_key=settings.LLM_API_KEY,
-                base_url=settings.LLM_BASE_URL.rstrip("/"),
-                timeout=settings.LLM_TIMEOUT,
-            )
-            response = client.chat.completions.create(
-                model=settings.LLM_MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=min(settings.LLM_TEMPERATURE, 0.4),
-                max_tokens=min(settings.LLM_MAX_TOKENS, max_tokens),
-                response_format={"type": "json_object"},
-            )
-            content = response.choices[0].message.content or "{}"
-            return json.loads(content)
-        except Exception as exc:
-            print(f"[AI面试] 大模型调用失败，使用本地规则降级: {exc}")
-            return None
-
-    def generate_question(
-        self,
-        target_position: str,
-        interview_type: str,
-        difficulty: str,
-        question_index: int,
-        previous_answers: Optional[list[str]] = None,
-    ) -> dict[str, Any]:
+    async def generate_feedback(self, question: str, answer: str) -> dict:
         """
-        生成面试问题
+        生成面试回答反馈
         
         Args:
-            target_position: 目标岗位
-            interview_type: 面试类型 (technical/behavioral/comprehensive)
-            difficulty: 难度 (easy/medium/hard)
-            question_index: 题目序号
-            previous_answers: 之前的回答列表（用于追问判断）
-        
-        Returns:
-            问题信息字典，包含 question, question_type, difficulty, expected_points, is_follow_up
-        """
-        templates = self.QUESTION_TEMPLATES.get(interview_type, self.QUESTION_TEMPLATES["comprehensive"])
-        template_info = templates[(question_index - 1) % len(templates)]
-        
-        difficulty_label = self.DIFFICULTY_LABELS.get(difficulty, "进阶")
-        question_text = f"第 {question_index} 题（{difficulty_label}）：{template_info['template'].format(position=target_position)}"
-
-        return {
-            "question": question_text,
-            "question_type": template_info["question_type"],
-            "difficulty": difficulty,
-            "expected_points": template_info["expected_points"],
-            "is_follow_up": False,
-        }
-
-    def should_follow_up(self, question: str, answer: str, answer_duration_seconds: Optional[int] = None) -> bool:
-        """
-        判断是否需要追问
-        
-        Args:
-            question: 原始问题
-            answer: 用户回答
-            answer_duration_seconds: 回答时长
+            question: 面试问题
+            answer: 候选人回答（文本）
             
         Returns:
-            是否需要追问
+            dict: {"score": float, "feedback": str, "suggestion": str}
         """
-        answer_length = len(answer.strip())
-        
-        # 回答过短，需要追问
-        if answer_length < 40:
-            return True
-        
-        # 回答中包含"可能"、"大概"、"一般"等模糊词汇，需要追问
-        vague_words = ("可能", "大概", "一般", "差不多", "还行", "还好", "应该")
-        if any(word in answer for word in vague_words):
-            return True
-        
-        # 回答时长过短（少于30秒），可能回答不够充分
-        if answer_duration_seconds and answer_duration_seconds < 30:
-            return True
-        
-        return False
+        if not answer or not answer.strip():
+            return {
+                "score": 65.0,
+                "feedback": "未检测到回答内容，请重新回答。",
+                "suggestion": "请确保麦克风正常工作，并清晰地说出你的回答。",
+            }
 
-    def generate_follow_up_question(self, original_question: str, answer: str) -> Optional[dict[str, Any]]:
-        """
-        生成追问问题
-        
-        Args:
-            original_question: 原始问题
-            answer: 用户回答
-            
-        Returns:
-            追问问题信息，如果不需要追问则返回 None
-        """
-        if not self.should_follow_up(original_question, answer):
-            return None
+        user_prompt = f"""面试问题：{question}
 
-        # 尝试使用大模型生成追问
-        if self._llm_enabled():
-            system_prompt = """你是一位专业的面试官。根据候选人的回答，生成一个针对性的追问问题，帮助深入了解候选人能力。
-只输出 JSON，格式：{"question": "追问问题"}"""
-            user_prompt = f"""原始问题：{original_question}
 候选人回答：{answer}
 
-请生成一个追问问题，用于进一步了解候选人的能力或经历。"""
-            
-            data = self._call_llm_json(system_prompt, user_prompt)
-            if data and data.get("question"):
-                return {
-                    "question": data["question"],
-                    "question_type": "follow_up",
-                    "difficulty": "medium",
-                    "expected_points": ["深入分析", "细节补充"],
-                    "is_follow_up": True,
-                }
+请给出评分和反馈。"""
 
-        # 兜底追问
-        follow_up_templates = [
-            "能否请你举一个具体的例子来说明？",
-            "在这个过程中，你遇到了哪些挑战，是如何解决的？",
-            "你提到的这个点很有趣，能否展开讲讲？",
-            "这个项目的最终结果如何，有什么量化指标吗？",
-            "在这个场景下，你为什么选择这种方案而不是其他方案？",
-        ]
-        
-        # 根据回答内容选择合适的追问
-        answer_lower = answer.lower()
-        if "项目" in answer or "负责" in answer:
-            template = "这个项目的最终结果如何，有什么量化指标吗？"
-        elif "方案" in answer or "设计" in answer:
-            template = "在这个场景下，你为什么选择这种方案而不是其他方案？"
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": INTERVIEW_FEEDBACK_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+            )
+
+            content = response.choices[0].message.content.strip()
+            
+            # 尝试解析 JSON
+            # 先尝试直接解析
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # 如果失败，尝试提取 JSON 部分
+                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    raise ValueError("无法解析 AI 返回的 JSON")
+
+            # 验证结果
+            score = float(result.get("score", 70))
+            score = max(0, min(100, score))  # 限制在 0-100
+            feedback = str(result.get("feedback", "回答已收到"))
+            suggestion = str(result.get("suggestion", "继续加油"))
+
+            return {
+                "score": round(score, 2),
+                "feedback": feedback,
+                "suggestion": suggestion,
+            }
+
+        except Exception as e:
+            logger.error("AI 反馈生成失败: %s", e)
+            # 降级到规则评分
+            return self._rule_based_scoring(answer)
+
+    def _rule_based_scoring(self, answer: str) -> dict:
+        """
+        降级方案：基于规则的评分
+        """
+        length = len(answer)
+        score = 70.0
+
+        if length < 20:
+            score = 50.0
+        elif length < 60:
+            score = 65.0
+        elif length < 150:
+            score = 78.0
         else:
-            template = follow_up_templates[(len(answer) // 20) % len(follow_up_templates)]
+            score = 86.0
+
+        structure_markers = ["首先", "其次", "最后", "例如", "因此", "结果", "第一", "第二"]
+        score += min(sum(marker in answer for marker in structure_markers) * 2, 8)
+
+        score = round(max(0.0, min(score, 100.0)), 2)
+
+        if score >= 85:
+            feedback = "回答内容充分，结构清晰，并体现了较好的岗位理解。"
+            suggestion = "继续补充可量化结果，让优势更有说服力。"
+        elif score >= 70:
+            feedback = "回答覆盖了主要信息，具备一定条理性。"
+            suggestion = "建议增加具体案例或更清晰的结构划分。"
+        elif score >= 60:
+            feedback = "回答基本切题，但内容和结构有待加强。"
+            suggestion = "建议先列出回答要点，再组织语言。"
+        else:
+            feedback = "回答内容较少或离题，需要更多练习。"
+            suggestion = "建议多进行模拟面试，提高表达能力和自信心。"
 
         return {
-            "question": template,
-            "question_type": "follow_up",
-            "difficulty": "medium",
-            "expected_points": ["深入分析", "细节补充"],
-            "is_follow_up": True,
+            "score": score,
+            "feedback": feedback,
+            "suggestion": suggestion,
         }
-
-    def is_interview_complete(
-        self,
-        question_count: int,
-        answered_count: int,
-        session_status: str,
-    ) -> bool:
-        """
-        判断面试是否结束
-        
-        Args:
-            question_count: 设定的题目数量
-            answered_count: 已回答的题目数量
-            session_status: 当前会话状态
-            
-        Returns:
-            是否结束
-        """
-        # 如果会话已标记为结束，则结束
-        if session_status == "finished":
-            return True
-        
-        # 如果已回答题目数量达到设定数量，则结束
-        if answered_count >= question_count:
-            return True
-        
-        return False

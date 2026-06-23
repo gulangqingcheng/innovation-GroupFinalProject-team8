@@ -1,771 +1,530 @@
+<!--
+  InterviewView.vue — AI 模拟面试页面
+  整合 ChatMessage + VoiceMessageBubble + MobileInputBar
+  支持文字和语音混合回答，统一评分流程
+-->
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { ref, onMounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { useChatStore } from '@/stores/chat'
-import AppHeader from '@/components/AppHeader.vue'
-import Sidebar from '@/components/Sidebar.vue'
-import {
-  answerInterviewSessionApi,
-  createInterviewSessionApi,
-  finishInterviewSessionApi,
-  getInterviewReportApi,
-  getInterviewReportDownloadUrl,
-  getInterviewSessionDetailApi,
-  type InterviewReport,
-  type InterviewSession,
-  type InterviewTurn,
-  startInterviewSessionApi,
-} from '@/api/interview'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useInterviewStore } from '@/stores/interview'
+import { getVoiceAnalysisApi } from '@/api/voice'
+import ChatMessage from '@/components/ChatMessage.vue'
+import MobileInputBar from '@/components/MobileInputBar.vue'
+import VoiceMessageBubble from '@/components/VoiceMessageBubble.vue'
+import type { VoiceRecorderResult } from '@/composables/useVoiceRecorder'
+import type { ChatMessage as ChatMessageType } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
-const chatStore = useChatStore()
-const loading = ref(false)
-const downloading = ref(false)
-const session = ref<InterviewSession | null>(null)
-const report = ref<InterviewReport | null>(null)
-const selectedHistoryId = ref<number | null>(null)
-const answerText = ref('')
-const answerStartedAt = ref<number | null>(null)
+const store = useInterviewStore()
 
-const form = reactive({
-  target_position: '前端开发工程师',
-  interview_type: 'technical' as 'technical' | 'behavioral' | 'comprehensive',
-  difficulty: 'medium' as 'easy' | 'medium' | 'hard',
-  question_count: 5,
-})
+const sessionId = Number(route.params.sessionId)
+const messageListRef = ref<HTMLElement | null>(null)
+const isInitializing = ref(true)
 
-const interviewTypeOptions = [
-  { label: '技术面试', value: 'technical' },
-  { label: '行为面试', value: 'behavioral' },
-  { label: '综合面试', value: 'comprehensive' },
-]
-
-const difficultyOptions = [
-  { label: '基础', value: 'easy' },
-  { label: '进阶', value: 'medium' },
-  { label: '深入', value: 'hard' },
-]
-
-const dimensionMax: Record<string, number> = {
-  岗位相关性: 18,
-  技术深度: 24,
-  逻辑结构: 18,
-  案例与结果: 18,
-  表达沟通: 12,
-  时间控制: 10,
+// ── 消息列表（混合展示 AI 问题、用户回答、语音消息、评分反馈） ──
+interface DisplayMessage {
+  id: string
+  role: 'ai' | 'user' | 'system'
+  type: 'question' | 'answer-text' | 'answer-voice' | 'feedback' | 'system'
+  content: string
+  audioUrl?: string
+  durationSeconds?: number
+  transcript?: string | null
+  transcriptStatus?: 'pending' | 'converting' | 'completed' | 'failed'
+  recordingId?: number
+  createdAt: number
 }
 
-const currentConversationId = computed<number | undefined>(() => {
-  const queryId = Number(route.query.conversation_id)
-  const storeId = Number(chatStore.currentConversationId)
-  if (Number.isFinite(queryId) && queryId > 0) return queryId
-  if (Number.isFinite(storeId) && storeId > 0) return storeId
-  return undefined
-})
+const messages = ref<DisplayMessage[]>([])
+let nextMessageId = 1
 
-const answeredTurns = computed(() => {
-  return (session.value?.turns || []).filter(item => item.answered_at)
-})
-
-const activeTurn = computed<InterviewTurn | null>(() => {
-  if (session.value?.status === 'finished') return null
-  const turns = session.value?.turns || []
-  return turns.find(item => !item.answered_at) || null
-})
-
-const isAllAnswered = computed(() => {
-  return !!session.value && answeredTurns.value.length >= session.value.question_count
-})
-
-const finishTitle = computed(() => {
-  if (!session.value) return ''
-  if (session.value.status === 'finished') {
-    return isAllAnswered.value ? '题目已完成' : '面试已提前结束'
-  }
-  return '题目已完成'
-})
-
-const finishTip = computed(() => {
-  if (!session.value) return ''
-  if (session.value.status === 'finished') {
-    return isAllAnswered.value
-      ? '本次面试已完成，下面可以查看综合评分、逐题依据和改进计划。'
-      : '本次面试已提前结束，未回答题目会按 0 分计入综合评分。'
-  }
-  return '点击生成报告，查看综合评分、维度分析、逐题依据和改进计划。'
-})
-
-function resetAnswerTimer() {
-  answerStartedAt.value = Date.now()
+function addMessage(msg: Omit<DisplayMessage, 'id' | 'createdAt'>) {
+  messages.value.push({
+    ...msg,
+    id: String(nextMessageId++),
+    createdAt: Date.now(),
+  })
 }
 
-function goBackToChat() {
-  router.push('/')
-}
-
-function resetInterview() {
-  session.value = null
-  report.value = null
-  selectedHistoryId.value = null
-  answerText.value = ''
-  answerStartedAt.value = null
-}
-
-function formatStatus(value: string) {
-  if (value === 'finished') return '已结束'
-  if (value === 'in_progress') return '进行中'
-  return '未开始'
-}
-
-async function ensureConversationContext() {
-  if (currentConversationId.value) return currentConversationId.value
-  await chatStore.createConversation('AI面试', 'interview')
-  const id = Number(chatStore.currentConversationId)
-  if (Number.isFinite(id) && id > 0) {
-    await router.replace({
-      path: '/interview',
-      query: { conversation_id: String(id) },
-    })
-    return id
-  }
-  return undefined
-}
-
-function notifyInterviewHistoryUpdated() {
-  window.dispatchEvent(new Event('interview-history-updated'))
-}
-
-async function openHistoryById(sessionId: number) {
-  if (!Number.isFinite(sessionId) || sessionId <= 0) return
-  loading.value = true
-  selectedHistoryId.value = sessionId
-  answerText.value = ''
-  try {
-    const detail = await getInterviewSessionDetailApi(sessionId)
-    session.value = detail.data
-    report.value = detail.data.report || null
-    if (detail.data.status === 'finished') {
-      try {
-        const reportRes = await getInterviewReportApi(sessionId)
-        report.value = reportRes.data
-      } catch {
-        // The detail response still carries the saved report when it exists.
-      }
-    } else {
-      resetAnswerTimer()
+function scrollToBottom() {
+  nextTick(() => {
+    if (messageListRef.value) {
+      messageListRef.value.scrollTop = messageListRef.value.scrollHeight
     }
-  } finally {
-    loading.value = false
-  }
+  })
 }
 
-async function createAndStartInterview() {
-  if (!form.target_position.trim()) {
-    ElMessage.warning('请输入目标岗位')
-    return
-  }
-
-  loading.value = true
-  report.value = null
-  answerText.value = ''
+// ── 初始化：开始面试 ──
+onMounted(async () => {
   try {
-    const created = await createInterviewSessionApi({
-      title: `${form.target_position} AI面试`,
-      conversation_id: await ensureConversationContext(),
-      target_position: form.target_position.trim(),
-      interview_type: form.interview_type,
-      difficulty: form.difficulty,
-      question_count: form.question_count,
-      answer_mode: 'text',
+    await store.startSession(sessionId)
+    const currentTurn = store.currentTurn
+    if (currentTurn) {
+      addMessage({
+        role: 'ai',
+        type: 'question',
+        content: currentTurn.question,
+      })
+      scrollToBottom()
+    }
+  } catch (err: any) {
+    ElMessage.error(err.response?.data?.detail || '加载面试失败')
+    router.replace('/interview-history')
+  } finally {
+    isInitializing.value = false
+  }
+})
+
+// ── 发送文字回答 ──
+async function handleSendText(text: string) {
+  try {
+    addMessage({
+      role: 'user',
+      type: 'answer-text',
+      content: text,
     })
-    const started = await startInterviewSessionApi(created.data.id)
-    session.value = started.data
-    selectedHistoryId.value = started.data.id
-    resetAnswerTimer()
-    const conversationId = started.data.conversation_id || currentConversationId.value
-    if (conversationId) {
-      await router.replace({
-        path: '/interview',
-        query: {
-          conversation_id: String(conversationId),
-          session_id: String(started.data.id),
-        },
+
+    const result = await store.submitAnswer({
+      answer_text: text,
+    })
+
+    const answeredTurn = result.turns.find(
+      (t) => t.question_index === (store.answeredTurns.length)
+    )
+    if (answeredTurn) {
+      addMessage({
+        role: 'system',
+        type: 'feedback',
+        content: answeredTurn.feedback || '评分完成',
       })
     }
-    notifyInterviewHistoryUpdated()
-    ElMessage.success('AI面试已开始')
-  } finally {
-    loading.value = false
+
+    // 下一题
+    const nextTurn = result.turns.find((t) => t.answered_at === null)
+    if (nextTurn) {
+      addMessage({
+        role: 'ai',
+        type: 'question',
+        content: nextTurn.question,
+      })
+    } else {
+      // 没有下一题，自动结束
+      await handleFinish()
+    }
+  } catch (err: any) {
+    ElMessage.error(err.response?.data?.detail || '提交失败')
+    // 移除失败的消息
+    messages.value.pop()
   }
+  scrollToBottom()
 }
 
-async function submitAnswer() {
-  if (!session.value || !activeTurn.value) return
-  if (!answerText.value.trim()) {
-    ElMessage.warning('请输入回答内容')
+// ── 语音回答 ──
+async function handleVoiceResult(result: VoiceRecorderResult) {
+  const transcript = result.extra.transcript || ''
+  const audioUrl = result.extra.audio_url || ''
+
+  // 防空保护：如果既没有转写文本也没有音频地址，提示用户
+  if (!transcript && !audioUrl) {
+    ElMessage.warning('语音上传成功，但转写结果暂未就绪。请稍后重试或使用文字输入。')
+    // 仍然展示语音气泡
+    addMessage({
+      role: 'user',
+      type: 'answer-voice',
+      content: '',
+      audioUrl: result.audioBlob ? URL.createObjectURL(result.audioBlob) : '',
+      durationSeconds: result.duration,
+      transcript: null,
+      transcriptStatus: 'pending',
+      recordingId: result.extra.recording_id || 0,
+    })
+    scrollToBottom()
     return
   }
 
-  const duration = answerStartedAt.value
-    ? Math.max(1, Math.round((Date.now() - answerStartedAt.value) / 1000))
-    : undefined
-
-  loading.value = true
   try {
-    const res = await answerInterviewSessionApi(session.value.id, {
-      answer_text: answerText.value.trim(),
-      answer_duration_seconds: duration,
+    addMessage({
+      role: 'user',
+      type: 'answer-voice',
+      content: '',
+      audioUrl: result.audioBlob ? URL.createObjectURL(result.audioBlob) : audioUrl,
+      durationSeconds: result.duration,
+      transcript: transcript || null,
+      transcriptStatus: transcript ? 'completed' : 'pending',
+      recordingId: result.extra.recording_id || 0,
     })
-    session.value = res.data
-    answerText.value = ''
-    resetAnswerTimer()
-    notifyInterviewHistoryUpdated()
-    ElMessage.success('回答已提交，评分已生成')
-  } finally {
-    loading.value = false
-  }
-}
 
-async function finishInterview() {
-  if (!session.value) return
-  loading.value = true
-  try {
-    const res = await finishInterviewSessionApi(session.value.id)
-    report.value = res.data
-    session.value = {
-      ...session.value,
-      status: 'finished',
-      total_score: res.data.total_score,
-      report: res.data,
+    const params: any = { answer_duration_seconds: result.duration }
+    // 优先用转写文本，没有时留空让后端通过 audioUrl 处理
+    if (transcript) {
+      params.answer_text = transcript
     }
-    notifyInterviewHistoryUpdated()
-    ElMessage.success('面试报告已生成')
-  } finally {
-    loading.value = false
+    if (audioUrl) {
+      params.answer_audio_url = audioUrl
+    }
+    if (result.extra.recording_id) {
+      params.recording_id = result.extra.recording_id
+    }
+
+    const sessionResult = await store.submitAnswer(params)
+
+    const answeredTurn = sessionResult.turns.find(
+      (t) => t.question_index === (store.answeredTurns.length)
+    )
+    if (answeredTurn) {
+      addMessage({
+        role: 'system',
+        type: 'feedback',
+        content: answeredTurn.feedback || '评分完成',
+      })
+    }
+
+    const nextTurn = sessionResult.turns.find((t) => t.answered_at === null)
+    if (nextTurn) {
+      addMessage({
+        role: 'ai',
+        type: 'question',
+        content: nextTurn.question,
+      })
+    } else {
+      await handleFinish()
+    }
+  } catch (err: any) {
+    ElMessage.error(err.response?.data?.detail || '提交失败')
+    messages.value.pop()
+  }
+  scrollToBottom()
+}
+
+// ── 语音错误 ──
+function handleVoiceError(msg: string) {
+  ElMessage.warning(msg)
+}
+
+// ── 语音转文字（长按触发） ──
+async function handleRequestTranscript(msgId: string, recordingId: number) {
+  if (recordingId <= 0) {
+    ElMessage.warning('录音未成功上传，无法转文字')
+    return
+  }
+
+  // 找到对应消息并标记为转写中
+  const msgIndex = messages.value.findIndex((m) => m.id === msgId)
+  if (msgIndex === -1) return
+  messages.value[msgIndex] = {
+    ...messages.value[msgIndex],
+    transcriptStatus: 'converting',
+  }
+
+  try {
+    const res = await getVoiceAnalysisApi(recordingId)
+    const transcript = res.data?.transcript || ''
+
+    if (transcript) {
+      messages.value[msgIndex] = {
+        ...messages.value[msgIndex],
+        transcript,
+        transcriptStatus: 'completed',
+      }
+      ElMessage.success('转写完成')
+    } else {
+      messages.value[msgIndex] = {
+        ...messages.value[msgIndex],
+        transcriptStatus: 'failed',
+      }
+      ElMessage.warning('暂未获取到转写结果，请稍后重试')
+    }
+  } catch (err: any) {
+    messages.value[msgIndex] = {
+      ...messages.value[msgIndex],
+      transcriptStatus: 'failed',
+    }
+    ElMessage.error(err.response?.data?.detail || '转写失败，请稍后重试')
   }
 }
 
-async function downloadReport() {
-  if (!session.value) return
-  downloading.value = true
+// ── 结束面试 ──
+async function handleFinish() {
   try {
-    const token = localStorage.getItem('access_token')
-    const response = await fetch(getInterviewReportDownloadUrl(session.value.id), {
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    await ElMessageBox.confirm('确认结束面试？结束后将生成报告。', '结束面试', {
+      confirmButtonText: '确认结束',
+      cancelButtonText: '继续答题',
     })
-    if (!response.ok) {
-      ElMessage.error('报告下载失败')
-      return
-    }
-    const blob = await response.blob()
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `${session.value.title}-面试报告.docx`
-    link.click()
-    URL.revokeObjectURL(url)
-  } finally {
-    downloading.value = false
+    const report = await store.finishSession(sessionId)
+    addMessage({
+      role: 'system',
+      type: 'system',
+      content: `面试结束！总分：${report.total_score} 分`,
+    })
+    scrollToBottom()
+    // 延迟跳转到报告页
+    setTimeout(() => {
+      router.push(`/interview/${sessionId}/report`)
+    }, 1500)
+  } catch {
+    // 用户取消
   }
 }
 
-function scoreStatus(score?: number | null) {
-  if (score == null) return 'info'
-  if (score >= 85) return 'success'
-  if (score >= 70) return 'warning'
-  return 'danger'
+// ── 转换消息为 ChatMessage 兼容格式 ──
+function toChatMessage(msg: DisplayMessage): ChatMessageType {
+  return {
+    id: msg.id,
+    conversation_id: sessionId,
+    role: msg.role as any,
+    content: msg.content,
+    message_type: msg.type === 'answer-voice' ? 'text' as any : 'text',
+    created_at: new Date(msg.createdAt).toISOString(),
+  } as ChatMessageType
 }
 
-watch(
-  () => Number(route.query.session_id) || null,
-  (sessionId) => {
-    if (sessionId && selectedHistoryId.value !== sessionId) {
-      openHistoryById(sessionId)
-    }
-  },
-  { immediate: true },
-)
-
-watch(currentConversationId, () => {
-  if (!route.query.session_id) resetInterview()
-})
-
-onMounted(() => {
-  notifyInterviewHistoryUpdated()
-})
+watch(() => messages.value.length, scrollToBottom)
 </script>
 
 <template>
-  <div class="interview-layout">
-    <AppHeader />
-
-    <div class="interview-body">
-      <Sidebar />
-
-      <main class="interview-main">
-        <section class="setup-panel">
-          <div class="panel-title">
-            <div>
-              <h1>AI面试官</h1>
-              <p>按岗位生成问题，回答后按六个维度评分，结束后生成详细报告并支持 Word 下载。</p>
-            </div>
-            <div class="panel-actions">
-              <el-button :icon="'Back'" @click="goBackToChat">返回对话</el-button>
-              <el-button type="primary" :loading="loading" :icon="'VideoPlay'" @click="createAndStartInterview">
-                开始面试
-              </el-button>
-            </div>
+  <div class="interview-view">
+    <!-- 顶部栏 -->
+    <header class="interview-header">
+      <button class="back-btn" @click="router.push('/interview-history')">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="15,18 9,12 15,6" />
+        </svg>
+      </button>
+      <div class="header-info">
+        <h2 class="header-title">AI 模拟面试</h2>
+        <div class="header-progress">
+          <div class="progress-bar">
+            <div class="progress-fill" :style="{ width: store.progress + '%' }" />
           </div>
+          <span class="progress-text">{{ store.answeredTurns.length }}/{{ store.currentSession?.question_count || 0 }}</span>
+        </div>
+      </div>
+      <button class="finish-btn" @click="handleFinish">结束</button>
+    </header>
 
-          <el-form :model="form" class="setup-form" label-position="top">
-            <el-form-item label="目标岗位">
-              <el-input v-model="form.target_position" placeholder="例如：Java后端开发工程师" />
-            </el-form-item>
-            <el-form-item label="面试类型">
-              <el-segmented v-model="form.interview_type" :options="interviewTypeOptions" />
-            </el-form-item>
-            <el-form-item label="难度">
-              <el-segmented v-model="form.difficulty" :options="difficultyOptions" />
-            </el-form-item>
-            <el-form-item label="题目数量">
-              <el-input-number v-model="form.question_count" :min="1" :max="10" />
-            </el-form-item>
-          </el-form>
-        </section>
-
-        <section v-if="session" class="workspace">
-          <div class="question-panel">
-            <div class="session-bar">
-              <div>
-                <span class="session-title">{{ session.title }}</span>
-                <el-tag :type="session.status === 'finished' ? 'success' : 'primary'">
-                  {{ formatStatus(session.status) }}
-                </el-tag>
-              </div>
-              <span class="session-progress">
-                {{ answeredTurns.length }} / {{ session.question_count }}
-              </span>
-            </div>
-
-            <div v-if="activeTurn" class="question-box">
-              <div class="question-index">第 {{ activeTurn.question_index }} 题</div>
-              <p>{{ activeTurn.question }}</p>
-              <el-input
-                v-model="answerText"
-                type="textarea"
-                :autosize="{ minRows: 7, maxRows: 12 }"
-                placeholder="建议按 STAR 结构回答：背景、任务、行动、结果，并补充技术细节和量化成果。"
-              />
-              <div class="question-actions">
-                <el-button :loading="loading" type="primary" :icon="'Check'" @click="submitAnswer">
-                  提交回答并评分
-                </el-button>
-                <el-button
-                  :disabled="answeredTurns.length === 0"
-                  :loading="loading"
-                  :icon="'DocumentChecked'"
-                  @click="finishInterview"
-                >
-                  {{ isAllAnswered ? '结束并生成报告' : '提前结束并生成报告' }}
-                </el-button>
-              </div>
-            </div>
-
-            <div v-else class="finished-box">
-              <el-icon :size="42"><CircleCheck /></el-icon>
-              <h2>{{ finishTitle }}</h2>
-              <p>{{ finishTip }}</p>
-              <div class="question-actions">
-                <el-button
-                  v-if="session.status !== 'finished'"
-                  type="primary"
-                  :loading="loading"
-                  :icon="'DocumentChecked'"
-                  @click="finishInterview"
-                >
-                  生成面试报告
-                </el-button>
-                <el-button
-                  v-else
-                  type="primary"
-                  :icon="'VideoPlay'"
-                  @click="resetInterview"
-                >
-                  重新开始面试
-                </el-button>
-              </div>
-            </div>
-          </div>
-
-          <div class="result-panel">
-            <h2>评分记录</h2>
-            <div v-if="answeredTurns.length === 0" class="empty-result">提交回答后，这里会显示每题评分和反馈。</div>
-            <div v-for="turn in answeredTurns" :key="turn.id" class="turn-result">
-              <div class="turn-head">
-                <span>第 {{ turn.question_index }} 题</span>
-                <el-tag :type="scoreStatus(turn.score)">{{ turn.score }}/100</el-tag>
-              </div>
-              <p class="feedback">{{ turn.feedback }}</p>
-              <p class="suggestion">{{ turn.suggestion }}</p>
-            </div>
-          </div>
-        </section>
-
-        <section v-if="report" class="report-panel">
-          <div class="report-header">
-            <div class="report-score">
-              <span>综合评分</span>
-              <strong>{{ report.total_score }}</strong>
-            </div>
-            <div class="report-summary">
-              <div class="report-title-row">
-                <h2>面试报告</h2>
-                <div class="panel-actions">
-                  <el-button :icon="'VideoPlay'" @click="resetInterview">重新开始</el-button>
-                  <el-button :loading="downloading" :icon="'Download'" @click="downloadReport">
-                    下载 Word
-                  </el-button>
-                </div>
-              </div>
-              <p>{{ report.summary }}</p>
-              <p class="score-basis">{{ report.score_basis }}</p>
-            </div>
-          </div>
-
-          <div v-if="report.dimension_scores" class="dimension-grid">
-            <div v-for="(value, name) in report.dimension_scores" :key="name" class="dimension-item">
-              <div class="dimension-line">
-                <span>{{ name }}</span>
-                <strong>{{ value }}/{{ dimensionMax[name] || 100 }}</strong>
-              </div>
-              <el-progress
-                :percentage="Math.round((value / (dimensionMax[name] || 100)) * 100)"
-                :stroke-width="8"
-                :show-text="false"
-              />
-            </div>
-          </div>
-
-          <div class="report-columns">
-            <div>
-              <h3>优势</h3>
-              <ul>
-                <li v-for="item in report.strengths" :key="item">{{ item }}</li>
-              </ul>
-            </div>
-            <div>
-              <h3>不足</h3>
-              <ul>
-                <li v-for="item in report.weaknesses" :key="item">{{ item }}</li>
-              </ul>
-            </div>
-          </div>
-
-          <div class="turn-analysis">
-            <h3>逐题评分依据</h3>
-            <div v-for="item in report.turn_performance" :key="item.question_index" class="analysis-card">
-              <div class="turn-head">
-                <span>第 {{ item.question_index }} 题</span>
-                <el-tag :type="scoreStatus(item.score)">{{ item.score }}/100</el-tag>
-              </div>
-              <p class="question-text">{{ item.question }}</p>
-              <p class="time-text">
-                回答时长：{{ item.answer_duration_seconds ?? '未记录' }} 秒
-              </p>
-              <div v-if="item.dimensions" class="mini-dimensions">
-                <span v-for="(value, name) in item.dimensions" :key="name">{{ name }} {{ value }}/{{ dimensionMax[name] }}</span>
-              </div>
-              <div class="evidence-grid">
-                <div>
-                  <h4>评分依据</h4>
-                  <ul>
-                    <li v-for="evidence in item.evidence" :key="evidence">{{ evidence }}</li>
-                  </ul>
-                </div>
-                <div>
-                  <h4>扣分点</h4>
-                  <ul>
-                    <li v-for="point in item.missing_points" :key="point">{{ point }}</li>
-                  </ul>
-                </div>
-              </div>
-              <p class="suggestion">{{ item.suggestion }}</p>
-            </div>
-          </div>
-
-          <div class="report-columns">
-            <div>
-              <h3>改进建议</h3>
-              <ul>
-                <li v-for="item in report.suggestions" :key="item">{{ item }}</li>
-              </ul>
-            </div>
-            <div>
-              <h3>训练计划</h3>
-              <ol>
-                <li v-for="item in report.action_plan" :key="item">{{ item }}</li>
-              </ol>
-            </div>
-          </div>
-        </section>
-      </main>
+    <!-- 消息列表 -->
+    <div v-if="isInitializing" class="loading-state">
+      <div class="loading-spinner" />
+      <span>正在准备面试...</span>
     </div>
+
+    <div v-else ref="messageListRef" class="message-area">
+      <template v-for="msg in messages" :key="msg.id">
+        <!-- AI 问题：使用 ChatMessage -->
+        <div v-if="msg.role === 'ai' || msg.role === 'system'" class="message-wrapper ai-message">
+          <ChatMessage :message="toChatMessage(msg)" />
+        </div>
+
+        <!-- 用户文字回答 -->
+        <div v-else-if="msg.type === 'answer-text'" class="message-wrapper user-message">
+          <div class="user-bubble">
+            <div class="user-text">{{ msg.content }}</div>
+          </div>
+        </div>
+
+        <!-- 用户语音回答 -->
+        <div v-else-if="msg.type === 'answer-voice'" class="message-wrapper user-message">
+          <div class="user-voice-bubble">
+            <VoiceMessageBubble
+              :audio-url="msg.audioUrl || ''"
+              :duration-seconds="msg.durationSeconds || 0"
+              :transcript="msg.transcript || null"
+              :transcript-status="msg.transcriptStatus || 'pending'"
+              :recording-id="msg.recordingId || 0"
+              @request-transcript="handleRequestTranscript(msg.id, $event)"
+            />
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- 底部输入栏 -->
+    <footer class="interview-footer">
+      <MobileInputBar
+        :disabled="store.isFinished || store.isSubmitting"
+        :loading="store.isSubmitting"
+        @send-text="handleSendText"
+        @voice-result="handleVoiceResult"
+        @voice-error="handleVoiceError"
+      />
+    </footer>
   </div>
 </template>
 
 <style scoped>
-.interview-layout {
-  height: 100vh;
+.interview-view {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
-  background: var(--color-bg);
+  height: 100vh;
+  max-width: 768px;
+  margin: 0 auto;
+  background: #F5F7FA;
 }
 
-.interview-body {
-  flex: 1;
-  min-height: 0;
+/* 顶部 */
+.interview-header {
   display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: #fff;
+  border-bottom: 1px solid #EBEEF5;
+  flex-shrink: 0;
 }
 
-.interview-main {
+.back-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: #606266;
+  cursor: pointer;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.back-btn:hover {
+  background: #F5F7FA;
+}
+
+.header-info {
   flex: 1;
   min-width: 0;
-  overflow-y: auto;
-  padding: 24px;
 }
 
-.setup-panel,
-.question-panel,
-.result-panel,
-.report-panel {
-  background: var(--color-card);
-  border: 1px solid var(--color-border-light);
-  border-radius: var(--radius-sm);
-}
-
-.setup-panel {
-  padding: 20px;
-  margin-bottom: 16px;
-}
-
-.panel-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.panel-title,
-.session-bar,
-.turn-head,
-.report-title-row,
-.dimension-line {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.panel-title h1 {
-  margin: 0 0 6px;
-  font-size: 24px;
-}
-
-.panel-title p,
-.score-basis,
-.feedback,
-.suggestion,
-.question-text,
-.time-text,
-.report-summary p,
-.report-panel li {
-  line-height: 1.65;
-  color: var(--color-text-secondary);
-}
-
-.setup-form {
-  margin-top: 18px;
-  display: grid;
-  grid-template-columns: minmax(220px, 1.4fr) minmax(260px, 1fr) minmax(180px, 0.8fr) 140px;
-  gap: 14px;
-  align-items: end;
-}
-
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.85fr);
-  gap: 16px;
-}
-
-.question-panel,
-.result-panel {
-  padding: 18px;
-}
-
-.session-title {
-  font-weight: 700;
-  margin-right: 10px;
-}
-
-.session-progress {
-  color: var(--color-text-secondary);
+.header-title {
+  font-size: 16px;
   font-weight: 600;
+  color: #303133;
+  margin: 0 0 6px;
 }
 
-.question-box {
-  margin-top: 20px;
-}
-
-.question-index {
-  color: var(--color-primary);
-  font-weight: 700;
-  margin-bottom: 8px;
-}
-
-.question-box p {
-  margin: 0 0 16px;
-  line-height: 1.7;
-}
-
-.question-actions {
-  margin-top: 14px;
+.header-progress {
   display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.finished-box,
-.empty-result {
-  min-height: 220px;
-  display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 10px;
-  color: var(--color-text-secondary);
-  text-align: center;
-}
-
-.result-panel h2,
-.report-panel h2,
-.report-panel h3,
-.report-panel h4 {
-  margin: 0;
-}
-
-.turn-result {
-  padding: 12px 0;
-  border-top: 1px solid var(--color-border-light);
-}
-
-.turn-result:first-of-type {
-  border-top: 0;
-}
-
-.report-panel {
-  margin-top: 16px;
-  padding: 18px;
-}
-
-.report-header {
-  display: grid;
-  grid-template-columns: 128px minmax(0, 1fr);
-  gap: 20px;
-  align-items: start;
-}
-
-.report-score {
-  min-height: 110px;
-  border-radius: var(--radius-sm);
-  background: var(--color-primary-lighter);
-  color: var(--color-primary);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-}
-
-.report-score strong {
-  font-size: 38px;
-  line-height: 1;
-}
-
-.dimension-grid {
-  margin-top: 18px;
-  display: grid;
-  grid-template-columns: repeat(5, minmax(150px, 1fr));
-  gap: 12px;
-}
-
-.dimension-item,
-.analysis-card {
-  border: 1px solid var(--color-border-light);
-  border-radius: var(--radius-sm);
-  padding: 12px;
-}
-
-.dimension-line {
-  margin-bottom: 8px;
-  font-size: var(--font-sm);
-}
-
-.report-columns,
-.evidence-grid {
-  margin-top: 18px;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
-}
-
-.turn-analysis {
-  margin-top: 18px;
-}
-
-.analysis-card {
-  margin-top: 12px;
-}
-
-.mini-dimensions {
-  display: flex;
-  flex-wrap: wrap;
   gap: 8px;
-  margin: 10px 0;
 }
 
-.mini-dimensions span {
-  padding: 3px 8px;
-  border-radius: 4px;
-  background: var(--color-bg);
-  color: var(--color-text-secondary);
-  font-size: var(--font-xs);
+.progress-bar {
+  flex: 1;
+  height: 4px;
+  background: #EBEEF5;
+  border-radius: 2px;
+  overflow: hidden;
 }
 
-@media (max-width: 1100px) {
-  .dimension-grid {
-    grid-template-columns: repeat(2, minmax(150px, 1fr));
-  }
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #534AB7, #6366F1);
+  border-radius: 2px;
+  transition: width 0.4s ease;
 }
 
-@media (max-width: 980px) {
-  .setup-form,
-  .workspace,
-  .report-header,
-  .report-columns,
-  .evidence-grid {
-    grid-template-columns: 1fr;
-  }
+.progress-text {
+  font-size: 12px;
+  color: #909399;
+  flex-shrink: 0;
+}
 
-  .panel-title,
-  .report-title-row {
-    flex-direction: column;
-    align-items: stretch;
-  }
+.finish-btn {
+  padding: 6px 16px;
+  border: 1px solid #F56C6C;
+  border-radius: 16px;
+  background: #fff;
+  color: #F56C6C;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
 
-  .dimension-grid {
-    grid-template-columns: 1fr;
-  }
+.finish-btn:hover {
+  background: #FEF0F0;
+}
+
+/* 加载 */
+.loading-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: #909399;
+}
+
+.loading-spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid #EBEEF5;
+  border-top-color: #534AB7;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 消息区域 */
+.message-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 用户消息气泡 */
+.message-wrapper {
+  max-width: 85%;
+}
+
+.message-wrapper.ai-message {
+  align-self: flex-start;
+  width: 100%;
+  max-width: 100%;
+}
+
+.message-wrapper.user-message {
+  align-self: flex-end;
+}
+
+.user-bubble {
+  background: linear-gradient(135deg, #534AB7, #6366F1);
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 16px 4px 16px 16px;
+  font-size: 15px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.user-text {
+  white-space: pre-wrap;
+}
+
+.user-voice-bubble {
+  background: #fff;
+  padding: 10px 14px;
+  border-radius: 16px 4px 16px 16px;
+  min-width: 200px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+}
+
+/* 底部输入 */
+.interview-footer {
+  flex-shrink: 0;
+  padding: 10px 16px;
+  padding-bottom: max(10px, env(safe-area-inset-bottom));
+  background: #fff;
+  border-top: 1px solid #EBEEF5;
 }
 </style>

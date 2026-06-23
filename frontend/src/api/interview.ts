@@ -1,104 +1,63 @@
+/**
+ * AI 模拟面试 API
+ */
 import request from './request'
 import type { APIResponse, PaginatedResponse } from '@/types'
+import type {
+  InterviewSession,
+  InterviewSessionDetail,
+  InterviewCreateParams,
+  InterviewAnswerParams,
+  InterviewReport,
+} from '@/types/interview'
 
-export interface InterviewSessionCreateParams {
-  title?: string
-  conversation_id?: number
-  target_position: string
-  interview_type: 'technical' | 'behavioral' | 'comprehensive'
-  difficulty: 'easy' | 'medium' | 'hard'
-  question_count: number
-  answer_mode: 'text' | 'audio'
-}
-
-export interface InterviewAnswerParams {
-  answer_text: string
-  answer_duration_seconds?: number
-  answer_audio_url?: string
-}
-
-export interface InterviewTurn {
-  id: number
-  question_index: number
-  question: string
-  answer_text?: string | null
-  answer_duration_seconds?: number | null
-  score?: number | null
-  feedback?: string | null
-  suggestion?: string | null
-  answered_at?: string | null
-}
-
-export interface InterviewSession {
-  id: number
-  title: string
-  conversation_id?: number | null
-  target_position: string
-  interview_type: string
-  difficulty: string
-  question_count: number
-  answer_mode: string
-  status: 'pending' | 'in_progress' | 'finished'
-  total_score?: number | null
-  report?: InterviewReport | null
-  turns?: InterviewTurn[]
-  created_at: string
-}
-
-export interface InterviewReport {
-  session_id: number
-  total_score: number
-  status: string
-  summary: string
-  score_basis?: string
-  dimension_scores?: Record<string, number>
-  turn_performance: Array<{
-    question_index: number
-    question: string
-    answer?: string
-    answer_duration_seconds?: number | null
-    score: number
-    dimensions?: Record<string, number>
-    evidence?: string[]
-    missing_points?: string[]
-    feedback: string
-    suggestion: string
-  }>
-  strengths?: string[]
-  weaknesses?: string[]
-  suggestions: string[]
-  action_plan?: string[]
-  generated_at: string
-}
-
-export function createInterviewSessionApi(data: InterviewSessionCreateParams): Promise<APIResponse<InterviewSession>> {
+/** 创建面试会话 */
+export function createInterviewApi(
+  data: InterviewCreateParams
+): Promise<APIResponse<InterviewSession>> {
   return request.post('/v1/interview/sessions', data)
 }
 
-export function getInterviewSessionsApi(params: { page: number; page_size: number; conversation_id?: number } = { page: 1, page_size: 20 }): Promise<APIResponse<PaginatedResponse<InterviewSession>>> {
-  return request.get('/v1/interview/sessions', { params })
+/** 获取面试会话列表 */
+export function listInterviewSessionsApi(
+  page = 1,
+  pageSize = 20
+): Promise<APIResponse<PaginatedResponse<InterviewSession>>> {
+  return request.get('/v1/interview/sessions', { params: { page, page_size: pageSize } })
 }
 
-export function getInterviewSessionDetailApi(sessionId: number): Promise<APIResponse<InterviewSession>> {
+/** 获取面试会话详情 */
+export function getInterviewSessionApi(
+  sessionId: number
+): Promise<APIResponse<InterviewSessionDetail>> {
   return request.get(`/v1/interview/sessions/${sessionId}`)
 }
 
-export function startInterviewSessionApi(sessionId: number): Promise<APIResponse<InterviewSession>> {
+/** 开始面试 */
+export function startInterviewSessionApi(
+  sessionId: number
+): Promise<APIResponse<InterviewSessionDetail>> {
   return request.post(`/v1/interview/sessions/${sessionId}/start`)
 }
 
-export function answerInterviewSessionApi(sessionId: number, data: InterviewAnswerParams): Promise<APIResponse<InterviewSession>> {
+/** 提交当前问题回答 */
+export function submitInterviewAnswerApi(
+  sessionId: number,
+  data: InterviewAnswerParams
+): Promise<APIResponse<InterviewSessionDetail>> {
   return request.post(`/v1/interview/sessions/${sessionId}/answer`, data)
 }
 
-export function finishInterviewSessionApi(sessionId: number): Promise<APIResponse<InterviewReport>> {
+/** 结束面试 */
+export function finishInterviewSessionApi(
+  sessionId: number
+): Promise<APIResponse<InterviewReport>> {
   return request.post(`/v1/interview/sessions/${sessionId}/finish`)
 }
 
-export function getInterviewReportApi(sessionId: number): Promise<APIResponse<InterviewReport>> {
+/** 获取面试报告 */
+export function getInterviewReportApi(
+  sessionId: number
+): Promise<APIResponse<InterviewReport>> {
   return request.get(`/v1/interview/sessions/${sessionId}/report`)
-}
-
-export function getInterviewReportDownloadUrl(sessionId: number): string {
-  return `/api/v1/interview/sessions/${sessionId}/report.docx`
 }
