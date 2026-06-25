@@ -280,6 +280,7 @@ def _score_answer_with_llm(
     system_prompt = """你是一位严谨的中文技术面试官。请按固定评分量表评估候选人回答，只输出 JSON。
 必须遵守稳定评分原则：同一个岗位、问题、回答和时长，应给出相同分数；只依据候选人实际回答，不脑补经历；不要因为鼓励候选人而加分。
 每个维度先判断档位再给分：空泛/未回答为 0%-35%，有方向但缺少细节为 36%-59%，基本完整为 60%-74%，具体且有方法/案例为 75%-89%，优秀且有量化结果/权衡/验证为 90%-100%。
+必须遵守扣分和封顶规则：score 要根据回答质量客观给出，不要总是给高分；如果回答很短（少于20字），score 不要超过60；如果回答离题或与问题不相关，score 不要超过50；如果没有具体项目、个人贡献、技术细节或可验证结果，即使表达流畅也不要超过70。
 评分量表总分 100：
 1. 岗位相关性 18 分：回答是否贴合目标岗位和问题。
 2. 技术深度 24 分：是否包含准确技术点、实现思路、原因分析、取舍或验证方法。
@@ -337,12 +338,12 @@ def _score_answer(session: InterviewSession, turn: InterviewTurn, request: Inter
     if not llm_result:
         return local_result
     return {
-        **local_result,
+        **llm_result,
         "evidence": llm_result.get("evidence") or local_result["evidence"],
         "missing_points": llm_result.get("missing_points") or local_result["missing_points"],
         "feedback": llm_result.get("feedback") or local_result["feedback"],
         "suggestion": llm_result.get("suggestion") or local_result["suggestion"],
-        "source": "local_score_llm_feedback",
+        "source": "llm_score_feedback",
     }
 
 
@@ -352,7 +353,7 @@ def _analyze_turn_for_report(session: InterviewSession, turn: InterviewTurn) -> 
         answer_duration_seconds=turn.answer_duration_seconds,
         answer_audio_url=turn.answer_audio_url,
     )
-    detail = _score_answer_locally(session, turn, fake_request)
+    detail = _score_answer(session, turn, fake_request)
     detail["score"] = float(turn.score or detail["score"])
     detail["feedback"] = turn.feedback or detail["feedback"]
     detail["suggestion"] = turn.suggestion or detail["suggestion"]

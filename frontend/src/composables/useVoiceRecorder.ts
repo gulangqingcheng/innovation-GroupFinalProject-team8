@@ -25,13 +25,20 @@ export type VoiceRecorderState =
   | 'recording'
   | 'cancelling'
   | 'too_short'
+  | 'invalid_audio'
   | 'cancelled'
 
-const MIN_RECORD_DURATION = 1
+const MIN_RECORD_DURATION = 3
+const MIN_AUDIO_BLOB_SIZE = 5 * 1024
 const CANCEL_DISTANCE = 80
 const POLL_INTERVAL_MS = 2000
 const MAX_POLL_TIME_MS = 180000
 const MAX_TRANSCRIPT_WAIT_MS = 90000
+
+function formatBytes(size: number) {
+  if (size < 1024) return `${size}B`
+  return `${(size / 1024).toFixed(1)}KB`
+}
 
 export function useVoiceRecorder() {
   const state = ref<VoiceRecorderState>('idle')
@@ -151,7 +158,6 @@ export function useVoiceRecorder() {
 
     const wasCancelling = state.value === 'cancelling'
     const recordedDuration = duration.value
-    const savedChunks = [...chunks.value]
     const recorder = mediaRecorder.value
     const mimeType = recorder.mimeType || getBestMimeType() || 'audio/webm'
     mediaRecorder.value = null
@@ -185,9 +191,28 @@ export function useVoiceRecorder() {
         state.value = 'idle'
         duration.value = 0
 
-        let audioBlob = new Blob(savedChunks, { type: mimeType })
+        const savedChunks = [...chunks.value]
+        chunks.value = []
+        const audioBlob = new Blob(savedChunks, { type: mimeType })
+
+        if (!savedChunks.length || audioBlob.size < MIN_AUDIO_BLOB_SIZE) {
+          state.value = 'invalid_audio'
+          const recordedSize = formatBytes(audioBlob.size)
+          const minSize = formatBytes(MIN_AUDIO_BLOB_SIZE)
+          lastError.value = savedChunks.length
+            ? `录音数据太小，未上传。录制 ${recordedDuration} 秒，只得到 ${recordedSize}，低于 ${minSize}；请检查浏览器麦克风权限、输入设备是否选对，或麦克风是否被其他软件占用。`
+            : `浏览器没有产生录音数据，未上传。录制 ${recordedDuration} 秒，但音频片段数为 0；请检查麦克风权限、输入设备和浏览器录音支持。`
+          isProcessing.value = false
+          resolve(null)
+          setTimeout(() => {
+            state.value = 'idle'
+          }, 1800)
+          return
+        }
+
         try {
-          const recordingId = await uploadAndPoll(audioBlob, mimeType)
+          const uploadResult = await uploadAndPoll(audioBlob, mimeType)
+          const recordingId = uploadResult.recordingId
           if (!recordingId) {
             resolve({
               audioBlob,
@@ -204,6 +229,22 @@ export function useVoiceRecorder() {
           }
 
           const detail = await getRecordingDetailApi(recordingId)
+          if (uploadResult.status === 'failed') {
+            lastError.value = '录音已上传，但语音转写失败：未识别到有效语音片段。请确认麦克风输入正常、说话声音足够清晰后重试。'
+            resolve({
+              audioBlob,
+              duration: recordedDuration,
+              extra: {
+                audio_url: detail.data.file_url || '',
+                duration_seconds: recordedDuration,
+                recording_id: recordingId,
+                transcript: '',
+                transcript_status: 'failed',
+              },
+            })
+            return
+          }
+
           const transcript = await pollForTranscript(recordingId)
           resolve({
             audioBlob,
@@ -255,14 +296,15 @@ export function useVoiceRecorder() {
       try {
         const statusRes = await getRecordingStatusApi(recordingId)
         const currentStatus = (statusRes.data as any)?.status
-        if (currentStatus === 'completed') return recordingId
-        if (currentStatus === 'failed') return recordingId
+        if (currentStatus === 'completed' || currentStatus === 'failed') {
+          return { recordingId, status: currentStatus as 'completed' | 'failed' }
+        }
       } catch (error) {
         console.warn('[useVoiceRecorder] status poll failed', error)
       }
     }
 
-    return recordingId
+    return { recordingId, status: 'pending' as const }
   }
 
   async function pollForTranscript(recordingId: number) {

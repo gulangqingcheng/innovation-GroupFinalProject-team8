@@ -1,7 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import PageTopHeader from '@/components/PageTopHeader.vue'
+import AppHeader from '@/components/AppHeader.vue'
 import { useAuthStore } from '@/stores/auth'
 import type { UserInfo } from '@/types'
 import {
@@ -217,7 +217,7 @@ onMounted(loadUserInfo)
 
 <template>
   <div class="profile-page">
-    <PageTopHeader title="个人中心" show-questions-entry />
+    <AppHeader />
     <div class="profile-body">
       <aside class="profile-nav">
         <div v-for="item in navItems" :key="item.key" class="nav-item" :class="{ active: activeTab === item.key }" @click="activeTab = item.key">

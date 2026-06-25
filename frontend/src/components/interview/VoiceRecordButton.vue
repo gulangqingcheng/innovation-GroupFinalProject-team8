@@ -66,8 +66,12 @@ async function finishRecording(pointerId: number) {
   }
   if (recorder.state.value === 'too_short') {
     emit('error', '录音时间过短，请重新录制')
+  } else if (recorder.state.value === 'invalid_audio') {
+    emit('error', recorder.lastError.value || '录音数据太小，未上传，请检查麦克风后重试')
   } else if (recorder.state.value === 'cancelled') {
     emit('error', '已取消录音')
+  } else if (recorder.lastError.value) {
+    emit('error', recorder.lastError.value)
   }
 }
 

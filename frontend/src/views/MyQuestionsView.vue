@@ -1,7 +1,7 @@
 ﻿<script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import PageTopHeader from '@/components/PageTopHeader.vue'
+import AppHeader from '@/components/AppHeader.vue'
 import type { DuplicateQuestionGroup, Question } from '@/types'
 import {
   createQuestionApi,
@@ -306,7 +306,7 @@ onMounted(fetchQuestions)
 
 <template>
   <div class="my-question-page">
-    <PageTopHeader title="我的题库" show-profile-entry />
+    <AppHeader />
     <main class="my-question-content">
       <div class="page-header">
         <div>

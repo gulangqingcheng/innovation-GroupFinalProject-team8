@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { useChatStore } from '@/stores/chat'
 import AppHeader from '@/components/AppHeader.vue'
 import Sidebar from '@/components/Sidebar.vue'
 import InterviewAnswerBar from '@/components/interview/InterviewAnswerBar.vue'
@@ -23,7 +22,6 @@ import {
 
 const route = useRoute()
 const router = useRouter()
-const chatStore = useChatStore()
 
 const loading = ref(false)
 const downloading = ref(false)
@@ -60,14 +58,6 @@ const dimensionMax: Record<string, number> = {
   时间控制: 10,
 }
 
-const currentConversationId = computed<number | undefined>(() => {
-  const queryId = Number(route.query.conversation_id)
-  const storeId = Number(chatStore.currentConversationId)
-  if (Number.isFinite(queryId) && queryId > 0) return queryId
-  if (Number.isFinite(storeId) && storeId > 0) return storeId
-  return undefined
-})
-
 const answeredTurns = computed(() => {
   return (session.value?.turns || []).filter((item) => item.answered_at)
 })
@@ -83,13 +73,11 @@ const isAllAnswered = computed(() => {
 })
 
 const reportReady = computed(() => session.value?.status === 'finished' && !!report.value)
+const primaryActionLabel = computed(() => reportReady.value ? '重新开始' : '开始面试')
+const primaryActionIcon = computed(() => reportReady.value ? 'RefreshLeft' : 'VideoPlay')
 
 function resetAnswerTimer() {
   answerStartedAt.value = Date.now()
-}
-
-function goBackToChat() {
-  router.push('/')
 }
 
 function resetInterview() {
@@ -114,20 +102,6 @@ function scoreStatus(score?: number | null) {
 
 function notifyInterviewHistoryUpdated() {
   window.dispatchEvent(new Event('interview-history-updated'))
-}
-
-async function ensureConversationContext() {
-  if (currentConversationId.value) return currentConversationId.value
-  await chatStore.createConversation('AI面试', 'interview')
-  const id = Number(chatStore.currentConversationId)
-  if (Number.isFinite(id) && id > 0) {
-    await router.replace({
-      path: '/interview',
-      query: { conversation_id: String(id) },
-    })
-    return id
-  }
-  return undefined
 }
 
 async function openHistoryById(sessionId: number) {
@@ -164,7 +138,6 @@ async function createAndStartInterview() {
   try {
     const created = await createInterviewSessionApi({
       title: `${form.target_position} AI面试`,
-      conversation_id: await ensureConversationContext(),
       target_position: form.target_position.trim(),
       interview_type: form.interview_type,
       difficulty: form.difficulty,
@@ -175,16 +148,12 @@ async function createAndStartInterview() {
     session.value = started.data
     selectedHistoryId.value = started.data.id
     resetAnswerTimer()
-    const conversationId = started.data.conversation_id || currentConversationId.value
-    if (conversationId) {
-      await router.replace({
-        path: '/interview',
-        query: {
-          conversation_id: String(conversationId),
-          session_id: String(started.data.id),
-        },
-      })
-    }
+    await router.replace({
+      path: '/interview',
+      query: {
+        session_id: String(started.data.id),
+      },
+    })
     notifyInterviewHistoryUpdated()
     ElMessage.success('AI 面试已开始')
   } finally {
@@ -192,12 +161,22 @@ async function createAndStartInterview() {
   }
 }
 
+function handlePrimaryInterviewAction() {
+  if (reportReady.value) {
+    resetInterview()
+    router.replace('/interview')
+    return
+  }
+  createAndStartInterview()
+}
+
 async function submitAnswerPayload(payload: InterviewAnswerParams, successMessage: string) {
   if (!session.value || !activeTurn.value) return
 
-  const duration = answerStartedAt.value
+  const elapsedDuration = answerStartedAt.value
     ? Math.max(1, Math.round((Date.now() - answerStartedAt.value) / 1000))
-    : payload.answer_duration_seconds
+    : undefined
+  const duration = payload.answer_duration_seconds ?? elapsedDuration
 
   loading.value = true
   try {
@@ -219,6 +198,11 @@ async function handleTextAnswer(text: string) {
 }
 
 async function handleVoiceResult(result: VoiceRecorderResult) {
+  if (result.extra.transcript_status === 'failed' && !result.extra.transcript) {
+    ElMessage.warning('录音已上传，但语音转写失败：未识别到有效语音片段。请检查麦克风输入后重新录制')
+    return
+  }
+
   const payload: InterviewAnswerParams = {
     answer_duration_seconds: result.duration,
   }
@@ -293,19 +277,20 @@ watch(
   (sessionId) => {
     if (sessionId && selectedHistoryId.value !== sessionId) {
       openHistoryById(sessionId)
+    } else if (!sessionId) {
+      resetInterview()
     }
   },
   { immediate: true },
 )
 
-watch(currentConversationId, () => {
-  if (!route.query.session_id) {
-    resetInterview()
-  }
-})
-
 onMounted(() => {
   notifyInterviewHistoryUpdated()
+  window.addEventListener('interview-create-requested', resetInterview)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('interview-create-requested', resetInterview)
 })
 </script>
 
@@ -324,9 +309,8 @@ onMounted(() => {
               <p>按岗位生成问题，支持文字和语音混合回答，结束后自动生成详细报告。</p>
             </div>
             <div class="panel-actions">
-              <el-button :icon="'Back'" @click="goBackToChat">返回对话</el-button>
-              <el-button type="primary" :loading="loading" :icon="'VideoPlay'" @click="createAndStartInterview">
-                开始面试
+              <el-button type="primary" :loading="loading" :icon="primaryActionIcon" @click="handlePrimaryInterviewAction">
+                {{ primaryActionLabel }}
               </el-button>
             </div>
           </div>
@@ -403,14 +387,6 @@ onMounted(() => {
                 >
                   生成面试报告
                 </el-button>
-                <el-button
-                  v-else
-                  type="primary"
-                  :icon="'VideoPlay'"
-                  @click="resetInterview"
-                >
-                  重新开始
-                </el-button>
               </div>
             </div>
           </div>
@@ -452,7 +428,6 @@ onMounted(() => {
               <div class="report-title-row">
                 <h2>面试报告</h2>
                 <div class="panel-actions">
-                  <el-button :icon="'VideoPlay'" @click="resetInterview">重新开始</el-button>
                   <el-button :loading="downloading" :icon="'Download'" @click="downloadReport">
                     下载 Word
                   </el-button>
@@ -546,9 +521,11 @@ onMounted(() => {
 
 <style scoped>
 .interview-layout {
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   background:
     radial-gradient(circle at top, rgba(83, 74, 183, 0.14), transparent 36%),
     var(--color-bg);
@@ -558,13 +535,16 @@ onMounted(() => {
   flex: 1;
   min-height: 0;
   display: flex;
+  overflow: hidden;
 }
 
 .interview-main {
   flex: 1;
+  height: 100%;
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
-  padding: 24px;
+  padding: 24px 24px 40px;
 }
 
 .setup-panel,

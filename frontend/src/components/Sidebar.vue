@@ -21,13 +21,6 @@ const interviewSessions = ref<InterviewSession[]>([])
 const interviewLoading = ref(false)
 const isInInterview = computed(() => route.path.startsWith('/interview'))
 const selectedInterviewSessionId = computed(() => Number(route.query.session_id) || null)
-const currentInterviewConversationId = computed<number | undefined>(() => {
-  const queryId = Number(route.query.conversation_id)
-  const storeId = Number(chatStore.currentConversationId)
-  if (Number.isFinite(queryId) && queryId > 0) return queryId
-  if (Number.isFinite(storeId) && storeId > 0) return storeId
-  return undefined
-})
 
 async function handleNewChat() {
   try {
@@ -38,6 +31,13 @@ async function handleNewChat() {
   } catch {
     // Keep the UI quiet; API errors are surfaced elsewhere.
   }
+}
+
+async function handleNewInterview() {
+  if (route.path !== '/interview' || route.query.session_id) {
+    await router.push('/interview')
+  }
+  window.dispatchEvent(new Event('interview-create-requested'))
 }
 
 async function handleSelectConversation(conversationId: number | string) {
@@ -76,7 +76,7 @@ function formatInterviewStatus(value: string) {
 }
 
 async function loadInterviewSessions() {
-  if (!isInInterview.value || !currentInterviewConversationId.value) {
+  if (!isInInterview.value) {
     interviewSessions.value = []
     return
   }
@@ -85,7 +85,6 @@ async function loadInterviewSessions() {
     const res = await getInterviewSessionsApi({
       page: 1,
       page_size: 30,
-      conversation_id: currentInterviewConversationId.value,
     })
     interviewSessions.value = res.data?.items || (res.data as any)?.data || []
   } finally {
@@ -94,12 +93,9 @@ async function loadInterviewSessions() {
 }
 
 async function handleSelectInterviewSession(item: InterviewSession) {
-  const conversationId = item.conversation_id || currentInterviewConversationId.value
-  if (!conversationId) return
   await router.push({
     path: '/interview',
     query: {
-      conversation_id: String(conversationId),
       session_id: String(item.id),
     },
   })
@@ -136,7 +132,7 @@ function plainPreview(text?: string | null) {
 }
 
 watch(
-  () => [route.path, route.query.conversation_id, chatStore.currentConversationId],
+  () => [route.path, route.query.session_id],
   loadInterviewSessions,
 )
 
@@ -152,7 +148,7 @@ onUnmounted(() => {
 
 <template>
   <aside class="sidebar" :style="{ width: sidebarWidth }">
-    <div v-if="!appStore.sidebarCollapsed" class="sidebar-header">
+    <div v-if="!appStore.sidebarCollapsed && !isInInterview" class="sidebar-header">
       <el-button
         type="primary"
         :icon="'Plus'"
@@ -163,7 +159,18 @@ onUnmounted(() => {
       </el-button>
     </div>
 
-    <div v-if="!appStore.sidebarCollapsed" class="conversations-section">
+    <div v-if="!appStore.sidebarCollapsed && isInInterview" class="sidebar-header">
+      <el-button
+        type="primary"
+        :icon="'Plus'"
+        class="new-chat-btn"
+        @click="handleNewInterview()"
+      >
+        新建面试
+      </el-button>
+    </div>
+
+    <div v-if="!appStore.sidebarCollapsed && !isInInterview" class="conversations-section">
       <div class="section-title">对话历史</div>
 
       <div class="conversations-list">
@@ -199,32 +206,30 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <div v-if="isInInterview" class="interview-history-section">
-        <div class="section-title history-section-title">
-          <span>面试历史</span>
-          <el-button text :loading="interviewLoading" :icon="'Refresh'" @click="loadInterviewSessions" />
-        </div>
+    </div>
 
-        <div class="interview-history-list">
-          <div v-if="interviewSessions.length === 0" class="interview-empty">
-            当前对话暂无面试记录
-          </div>
-          <button
-            v-for="item in interviewSessions"
-            :key="item.id"
-            class="interview-history-item"
-            :class="{ active: selectedInterviewSessionId === item.id }"
-            type="button"
-            @click="handleSelectInterviewSession(item)"
-          >
-            <span class="interview-title text-ellipsis">{{ item.title }}</span>
-            <span class="interview-meta text-ellipsis">
-              {{ formatInterviewType(item.interview_type) }} · {{ formatDifficulty(item.difficulty) }} ·
-              {{ formatInterviewStatus(item.status) }}
-            </span>
-            <strong v-if="item.total_score != null">{{ item.total_score }}/100</strong>
-          </button>
+    <div v-if="!appStore.sidebarCollapsed && isInInterview" class="conversations-section">
+      <div class="section-title">面试历史</div>
+
+      <div class="interview-history-list full">
+        <div v-if="interviewSessions.length === 0" class="interview-empty">
+          暂无面试记录
         </div>
+        <button
+          v-for="item in interviewSessions"
+          :key="item.id"
+          class="interview-history-item"
+          :class="{ active: selectedInterviewSessionId === item.id }"
+          type="button"
+          @click="handleSelectInterviewSession(item)"
+        >
+          <span class="interview-title text-ellipsis">{{ item.title }}</span>
+          <span class="interview-meta text-ellipsis">
+            {{ formatInterviewType(item.interview_type) }} · {{ formatDifficulty(item.difficulty) }} ·
+            {{ formatInterviewStatus(item.status) }}
+          </span>
+          <strong v-if="item.total_score != null">{{ item.total_score }}/100</strong>
+        </button>
       </div>
     </div>
 
@@ -321,6 +326,11 @@ onUnmounted(() => {
   padding: 0 var(--spacing-sm) var(--spacing-sm);
 }
 
+.interview-history-list.full {
+  flex: 1;
+  padding: 0 var(--spacing-sm);
+}
+
 .interview-empty {
   padding: 12px var(--spacing-sm);
   color: var(--color-text-placeholder);
@@ -329,15 +339,16 @@ onUnmounted(() => {
 
 .interview-history-item {
   width: 100%;
+  min-height: 72px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--color-text);
   cursor: pointer;
   display: grid;
-  gap: 4px;
+  gap: 5px;
   margin-bottom: 2px;
-  padding: 9px 11px;
+  padding: 10px 11px;
   text-align: left;
   transition: background 0.2s, border-color 0.2s;
 }
@@ -349,16 +360,19 @@ onUnmounted(() => {
 
 .interview-title {
   font-size: var(--font-sm);
-  font-weight: 600;
+  font-weight: 500;
+  line-height: 1.35;
 }
 
 .interview-meta {
   color: var(--color-text-secondary);
   font-size: var(--font-xs);
+  line-height: 1.4;
 }
 
 .interview-history-item strong {
   font-size: 12px;
+  line-height: 1.2;
 }
 
 .empty-state {

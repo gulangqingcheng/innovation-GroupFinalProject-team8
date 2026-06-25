@@ -1,6 +1,5 @@
 ﻿<script setup lang="ts">
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import Sidebar from '@/components/Sidebar.vue'
@@ -16,7 +15,6 @@ interface FeatureTag {
   accept?: string
 }
 
-const router = useRouter()
 const chatStore = useChatStore()
 const messageListRef = ref<HTMLElement | null>(null)
 const inputText = ref('')
@@ -36,7 +34,6 @@ const featureTags: FeatureTag[] = [
   { key: 'resume', label: '简历评估', icon: 'Document', accept: '.pdf,.doc,.docx,.jpg,.jpeg,.png' },
   { key: 'recording', label: '录音分析', icon: 'Microphone', accept: '.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.avi,.mov' },
   { key: 'question', label: '面试题生成', icon: 'EditPen', accept: '.pdf,.doc,.docx,.jpg,.jpeg,.png' },
-  { key: 'interview', label: 'AI面试', icon: 'UserFilled' },
 ]
 
 const activeTag = computed(() => chatStore.activeAgentType)
@@ -50,17 +47,6 @@ function scrollToBottom() {
 }
 
 async function handleTagClick(tag: FeatureTag) {
-  if (tag.key === 'interview') {
-    if (!chatStore.currentConversationId) {
-      await chatStore.createConversation('AI面试', 'interview')
-    }
-    router.push({
-      path: '/interview',
-      query: { conversation_id: String(chatStore.currentConversationId) },
-    })
-    return
-  }
-
   if (activeTag.value === tag.key) {
     chatStore.activeAgentType = 'general'
     return

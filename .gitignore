@@ -45,7 +45,8 @@ tmp-edge-profile*/
 tmp-edge-dom.html
 *.log
 
-# Office temporary files
+# Office files (exclude all docx from repo)
+*.docx
 ~$*.docx
 *.wbk
 
