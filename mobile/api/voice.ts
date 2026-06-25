@@ -24,7 +24,7 @@ export function getVoiceDetailApi(recordingId: number): Promise<APIResponse<Reco
   return request.get(`/v1/recording/${recordingId}`)
 }
 
-/** 获取录音分析结果 */
+/** 获取录音 分析结果 */
 export function getVoiceAnalysisApi(recordingId: number): Promise<APIResponse<RecordingResult>> {
   return request.get(`/v1/recording/${recordingId}/analysis`)
 }
